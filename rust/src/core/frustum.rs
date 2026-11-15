@@ -1,13 +1,15 @@
-//! Six-plane frustum vs. tile height-column test, used by the eviction pass (Godot does not
-//! report per-instance culling results). Planes follow Godot's convention: `normal · p = d`,
+//! Six-plane frustum vs. tile box test, used by the eviction pass (Godot does not report
+//! per-instance culling results). Planes follow Godot's convention: `normal · p = d`,
 //! normals pointing OUTWARD, so a point is inside iff `normal · p − d <= 0` for all six.
 
-use super::config::{MAX_WORLD_HEIGHT, MIN_WORLD_HEIGHT, WORLD_HEIGHT_MARGIN};
 use glam::Vec3;
 
+/// A plane `normal · p = d`, the normal pointing out of the frustum.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Plane {
+    /// Outward normal.
     pub normal: Vec3,
+    /// Distance along the normal from the origin.
     pub d: f32,
 }
 
@@ -18,22 +20,18 @@ impl Plane {
     }
 }
 
+/// Six planes bounding what a camera sees.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Frustum {
+    /// The planes, normals outward.
     pub planes: [Plane; 6],
 }
 
 impl Frustum {
-    /// True when the vertical column `[center ± half] × [MIN_WORLD_HEIGHT, MAX_WORLD_HEIGHT +
-    /// margin]` intersects the frustum. Tests the AABB corner least along each outward normal:
-    /// if even that corner is outside a plane, the whole box is.
-    pub fn intersects_column(&self, center_x: f32, center_z: f32, half: f32) -> bool {
-        let min = Vec3::new(center_x - half, MIN_WORLD_HEIGHT, center_z - half);
-        let max = Vec3::new(
-            center_x + half,
-            MAX_WORLD_HEIGHT + WORLD_HEIGHT_MARGIN,
-            center_z + half,
-        );
+    /// True when the axis-aligned box `min..max` may intersect the frustum. Tests the corner
+    /// least along each outward normal: if even that corner is outside a plane, the whole box
+    /// is.
+    pub fn intersects_box(&self, min: Vec3, max: Vec3) -> bool {
         self.planes.iter().all(|p| {
             let c = Vec3::new(
                 if p.normal.x > 0.0 { min.x } else { max.x },
@@ -74,9 +72,16 @@ mod tests {
         let f = cube();
         assert!(f.contains_point(Vec3::ZERO));
         assert!(!f.contains_point(Vec3::new(11.0, 0.0, 0.0)));
-        assert!(f.intersects_column(0.0, 0.0, 1.0));
-        assert!(f.intersects_column(10.5, 0.0, 1.0)); // overlaps the +x face
-        assert!(!f.intersects_column(12.0, 0.0, 1.0)); // fully outside +x
-        assert!(!f.intersects_column(0.0, 12.0, 1.0));
+        let column = |x: f32, z: f32, y: f32| {
+            f.intersects_box(
+                Vec3::new(x - 1.0, y, z - 1.0),
+                Vec3::new(x + 1.0, y + 5.0, z + 1.0),
+            )
+        };
+        assert!(column(0.0, 0.0, 0.0));
+        assert!(column(10.5, 0.0, 0.0));
+        assert!(!column(12.0, 0.0, 0.0));
+        assert!(!column(0.0, 12.0, 0.0));
+        assert!(!column(0.0, 0.0, 11.0));
     }
 }

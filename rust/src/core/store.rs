@@ -4,9 +4,10 @@
 //! `reconcile` returns keys to free, `next_promotion` hands out payloads to upload,
 //! `mark_resident` records a finished upload, `set_visible` feeds back culling results.
 
-use super::config::{NetworkConfig, StreamingConfig, WorldConfig};
-use super::height::{ground_height, HeightGrid, HeightGrids};
-use super::lod::{self, LodOptions, TileKey};
+use super::config::{NetworkConfig, StreamingConfig, WorldConfig, MAX_ZOOM};
+use super::geometry::TileGeometry;
+use super::height::{ground_height, HeightGrids};
+use super::lod::{self, LodOptions, LodPolicy, TileKey};
 use super::source::{Source, TileDrop, TilePayload, TileRequest, TileSource};
 use glam::Vec3;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -20,6 +21,8 @@ pub struct ResidentInfo {
     pub abs_z: f64,
     /// World size of the tile in meters.
     pub size: f32,
+    /// Meters the tile is drawn below the ground (its ring's drop).
+    pub drop: f32,
     /// Desired-set membership (for debug overlays).
     pub desired: bool,
     /// Last frame's frustum result, fed back by the shell.
@@ -33,17 +36,24 @@ pub struct Status {
     pub loading: bool,
     /// Fraction of the desired set that is resident, [0, 1].
     pub progress: f32,
+    /// Resident tiles.
     pub resident: usize,
+    /// Tiles the policy wants.
     pub desired: usize,
+    /// Tiles being fetched.
     pub loading_count: usize,
 }
 
+/// The tile lifecycle bookkeeping (raytiles' `tile_store` maps): which tiles exist, which
+/// should exist, which are being fetched.
 pub struct TileStore<S: Source = TileSource> {
     world: WorldConfig,
     streaming: StreamingConfig,
     lod_opts: LodOptions,
     source: S,
     desired: HashSet<TileKey>,
+    pinned: HashSet<TileKey>,
+    pinned_changed: bool,
     loading: HashSet<TileKey>,
     resident: HashMap<TileKey, ResidentInfo>,
     grids: HeightGrids,
@@ -65,13 +75,14 @@ impl TileStore<TileSource> {
         network: &NetworkConfig,
     ) -> Result<Self, String> {
         world.validate()?;
-        streaming.validate()?;
-        let source = TileSource::new(network)?;
+        streaming.validate(&world)?;
+        let source = TileSource::new(network, &world)?;
         Ok(Self::with_source(world, streaming, source))
     }
 }
 
 impl<S: Source> TileStore<S> {
+    /// A store over any source (a scripted one in tests).
     pub fn with_source(world: WorldConfig, streaming: StreamingConfig, source: S) -> Self {
         let lod_opts = LodOptions {
             base_zoom: world.base_zoom,
@@ -79,6 +90,7 @@ impl<S: Source> TileStore<S> {
             base_tile_size: world.tile_size,
             radius: streaming.radius,
             thresholds: streaming.thresholds,
+            policy: streaming.policy.clone(),
         };
         Self {
             world,
@@ -86,6 +98,8 @@ impl<S: Source> TileStore<S> {
             lod_opts,
             source,
             desired: HashSet::new(),
+            pinned: HashSet::new(),
+            pinned_changed: false,
             loading: HashSet::new(),
             resident: HashMap::new(),
             grids: HeightGrids::default(),
@@ -100,22 +114,38 @@ impl<S: Source> TileStore<S> {
         }
     }
 
+    /// The world it streams.
     pub fn world(&self) -> &WorldConfig {
         &self.world
     }
 
+    /// Its streaming policy.
     pub fn streaming(&self) -> &StreamingConfig {
         &self.streaming
     }
 
+    /// World size (meters) of one tile at `zoom`.
     pub fn zoom_size(&self, zoom: u8) -> f64 {
         self.world.zoom_size(zoom)
     }
 
-    // -- frame steps ---------------------------------------------------------
+    /// Tiles the app draws itself: never requested, and (quadtree) subdivided down to so that
+    /// nothing is drawn over them. Takes effect at the next desired-set update, which it forces.
+    pub fn set_pinned(&mut self, pinned: HashSet<TileKey>) {
+        if pinned != self.pinned {
+            self.pinned = pinned;
+            self.pinned_changed = true;
+        }
+    }
 
-    /// Evict residents that are NOT desired AND (base zoom | not visible last frame | beyond the
-    /// horizon | covered by a resident parent / all children / grandparent / all grandchildren).
+    /// The pinned tiles.
+    pub fn pinned(&self) -> &HashSet<TileKey> {
+        &self.pinned
+    }
+
+    /// Evict residents that are NOT desired AND (rings policy | base zoom | not visible last
+    /// frame | beyond the horizon | covered by a resident parent / all children / grandparent /
+    /// all grandchildren).
     /// The covered-by rule protects against holes in the ground; its checks are gated on
     /// `coverage_dirty`. Returns the evicted keys (already removed from the store).
     pub fn reconcile(&mut self, abs_cam: Vec3) -> Vec<TileKey> {
@@ -129,10 +159,12 @@ impl<S: Source> TileStore<S> {
             .copied()
             .collect();
         candidates.sort();
+        let rings = matches!(self.streaming.policy, LodPolicy::Rings(_));
         let mut evict = Vec::new();
         for key in candidates {
             let info = self.resident[&key];
-            let remove = if key.zoom == self.world.base_zoom
+            let remove = if rings
+                || key.zoom == self.world.base_zoom
                 || !info.visible
                 || lod::out_of_horizon(abs_cam, self.world.zoom_size(key.zoom), key)
             {
@@ -154,7 +186,7 @@ impl<S: Source> TileStore<S> {
 
     fn is_covered(&self, key: TileKey) -> bool {
         let has = |zoom: u8, x: i32, z: i32| self.resident.contains_key(&TileKey { zoom, x, z });
-        let (base, max) = (self.world.base_zoom, self.world.max_zoom);
+        let (base, max) = (self.world.base_zoom, MAX_ZOOM);
         if key.zoom > base && has(key.zoom - 1, key.x >> 1, key.z >> 1) {
             return true;
         }
@@ -222,29 +254,32 @@ impl<S: Source> TileStore<S> {
         None
     }
 
-    /// The shell finished uploading `key`: register residency and its height grid.
-    pub fn mark_resident(&mut self, key: TileKey, grid: HeightGrid) -> ResidentInfo {
+    /// The shell finished uploading `key`: register residency and its geometry.
+    pub fn mark_resident(&mut self, key: TileKey, geometry: TileGeometry) -> ResidentInfo {
         let size = self.world.zoom_size(key.zoom);
         let info = ResidentInfo {
             abs_x: (f64::from(key.x) + 0.5) * size,
             abs_z: (f64::from(key.z) + 0.5) * size,
             size: size as f32,
+            drop: self.streaming.policy.drop(key.zoom),
             desired: self.desired.contains(&key),
             visible: false, // decided by the cull pass later this frame
         };
         self.resident.insert(key, info);
-        self.grids.0.insert(key, grid);
+        self.grids.0.insert(key, geometry);
         self.coverage_dirty = true; // a new resident can cover parent / children
         info
     }
 
-    /// Movement-gated desired-set rebuild; returns true when it ran.
+    /// Movement-gated desired-set rebuild (also run when the pinned set changed); returns true
+    /// when it ran.
     pub fn maybe_update_desired(&mut self, abs_cam: Vec3) -> bool {
         let d = self.streaming.update_distance;
-        let moved = match self.last_desired_pos {
-            None => true,
-            Some(last) => abs_cam.distance_squared(last) > d * d,
-        };
+        let moved = self.pinned_changed
+            || match self.last_desired_pos {
+                None => true,
+                Some(last) => abs_cam.distance_squared(last) > d * d,
+            };
         if moved {
             self.last_desired_pos = Some(abs_cam);
             self.update_desired(abs_cam);
@@ -255,8 +290,14 @@ impl<S: Source> TileStore<S> {
     /// Run the pure LOD policy, cancel loading keys that fell out of the set (once, here — the
     /// set only changes in this function), and request the missing ones.
     pub fn update_desired(&mut self, abs_cam: Vec3) {
+        self.pinned_changed = false;
         self.desired_scratch.clear();
-        lod::desired_tiles(&self.lod_opts, abs_cam, &mut self.desired_scratch);
+        lod::desired_tiles(
+            &self.lod_opts,
+            abs_cam,
+            &self.pinned,
+            &mut self.desired_scratch,
+        );
         self.desired.clear();
         self.desired.extend(self.desired_scratch.iter().copied());
         self.coverage_dirty = true;
@@ -287,44 +328,44 @@ impl<S: Source> TileStore<S> {
     }
 
     fn request(&mut self, key: TileKey) {
-        let scale = 1i32 << (key.zoom - self.world.base_zoom);
-        self.source.request(TileRequest {
-            key,
-            x: key.x + self.world.anchor_x * scale,
-            z: key.z + self.world.anchor_z * scale,
-        });
+        let (x, z) = self.world.provider_tile(key);
+        self.source.request(TileRequest { key, x, z });
         self.loading.insert(key);
     }
 
-    // -- facts & queries -----------------------------------------------------
-
+    /// Feed back last frame's culling result for a resident tile.
     pub fn set_visible(&mut self, key: TileKey, visible: bool) {
         if let Some(info) = self.resident.get_mut(&key) {
             info.visible = visible;
         }
     }
 
+    /// Every resident tile.
     pub fn resident_iter(&self) -> impl Iterator<Item = (&TileKey, &ResidentInfo)> {
         self.resident.iter()
     }
 
+    /// The resident keys.
     pub fn resident_keys(&self) -> Vec<TileKey> {
         self.resident.keys().copied().collect()
     }
 
+    /// Whether a tile is resident.
     pub fn is_resident(&self, key: TileKey) -> bool {
         self.resident.contains_key(&key)
     }
 
+    /// Whether the policy wants a tile.
     pub fn is_desired(&self, key: TileKey) -> bool {
         self.desired.contains(&key)
     }
 
+    /// Whether a tile is being fetched.
     pub fn is_loading_key(&self, key: TileKey) -> bool {
         self.loading.contains(&key)
     }
 
-    /// Terrain altitude under an ABSOLUTE-space point.
+    /// Terrain altitude under an absolute-space point, on the drawn triangles.
     pub fn ground_height(&self, abs: Vec3) -> Option<f32> {
         ground_height(&self.grids, &self.world, abs)
     }
@@ -358,8 +399,14 @@ impl<S: Source> TileStore<S> {
         }
     }
 
+    /// The failures since the last call.
     pub fn take_failures(&mut self) -> Vec<(TileKey, String)> {
         std::mem::take(&mut self.failures)
+    }
+
+    /// A resident tile's geometry.
+    pub fn geometry(&self, key: TileKey) -> Option<&TileGeometry> {
+        self.grids.0.get(&key)
     }
 
     /// Undo a `mark_resident` whose GPU upload failed: the key is forgotten (it will be requested
@@ -373,7 +420,7 @@ impl<S: Source> TileStore<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::synth;
+    use crate::core::lod::Ring;
     use std::sync::{Arc, Mutex};
 
     /// A scripted source: records requests/cancels, hands out whatever the test queues.
@@ -403,13 +450,16 @@ mod tests {
     }
 
     fn payload(key: TileKey, h: f32) -> TilePayload {
-        let height = synth::encode_terrarium(&[h; 4], 2, 2);
         TilePayload {
             key,
             albedo: image::RgbaImage::from_pixel(2, 2, image::Rgba([1, 2, 3, 255])),
-            grid: HeightGrid::from_terrarium(&height),
-            height,
-            normals: synth::default_normals(2),
+            geometry: TileGeometry {
+                key,
+                size: WorldConfig::default().zoom_size(key.zoom),
+                segments: 1,
+                heights: vec![h; 4],
+                normals: vec![[0.0, 1.0, 0.0]; 4],
+            },
         }
     }
 
@@ -426,7 +476,7 @@ mod tests {
         let mut out = Vec::new();
         while let Some(p) = store.next_promotion() {
             out.push(p.key);
-            store.mark_resident(p.key, p.grid);
+            store.mark_resident(p.key, p.geometry);
         }
         out
     }
@@ -541,7 +591,7 @@ mod tests {
     }
 
     fn resident_visible(s: &mut TileStore<Fake>, key: TileKey) {
-        s.mark_resident(key, payload(key, 0.0).grid);
+        s.mark_resident(key, payload(key, 0.0).geometry);
         s.set_visible(key, true);
     }
 
@@ -672,7 +722,7 @@ mod tests {
             x: 0,
             z: 0,
         };
-        s.mark_resident(key, payload(key, 123.0).grid);
+        s.mark_resident(key, payload(key, 123.0).geometry);
         assert_eq!(s.ground_height(Vec3::new(100.0, 0.0, 100.0)), Some(123.0));
         s.set_visible(key, false);
         s.reconcile(Vec3::new(100.0, 10.0, 100.0));
@@ -686,5 +736,73 @@ mod tests {
         assert!(s.maybe_update_desired(Vec3::new(0.0, 100.0, 0.0)));
         assert!(!s.maybe_update_desired(Vec3::new(10.0, 100.0, 0.0)));
         assert!(s.maybe_update_desired(Vec3::new(600.0, 100.0, 0.0)));
+    }
+
+    #[test]
+    fn pinned_tiles_are_never_requested_and_force_a_rebuild() {
+        let fake = Fake::default();
+        let mut s = store(&fake);
+        let cam = Vec3::new(33_200.0, 60_000.0, 33_200.0);
+        assert!(s.maybe_update_desired(cam));
+        let key = fake.0.lock().unwrap().requests[0].key;
+        s.set_pinned([key].into());
+        assert!(s.maybe_update_desired(cam));
+        assert!(!s.is_desired(key));
+        assert!(fake.0.lock().unwrap().cancels.contains(&key));
+        assert!(!s.maybe_update_desired(cam));
+        s.set_pinned([key].into());
+        assert!(!s.maybe_update_desired(cam));
+    }
+
+    #[test]
+    fn rings_evict_whatever_is_not_desired_and_carry_their_drop() {
+        let fake = Fake::default();
+        let streaming = StreamingConfig {
+            policy: LodPolicy::Rings(vec![
+                Ring {
+                    zoom: 15,
+                    radius: 0,
+                    drop: 0.0,
+                },
+                Ring {
+                    zoom: 12,
+                    radius: 0,
+                    drop: 2.5,
+                },
+            ]),
+            ..Default::default()
+        };
+        let mut s = TileStore::with_source(WorldConfig::default(), streaming, fake.clone());
+        let cam = Vec3::new(10.0, 2.0, 10.0);
+        s.update_desired(cam);
+        let keys: Vec<TileKey> = fake
+            .0
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(keys.len(), 2);
+        for k in &keys {
+            fake.0.lock().unwrap().ready.push(payload(*k, 0.0));
+        }
+        promote_all(&mut s);
+        let coarse = keys.iter().copied().find(|k| k.zoom == 12).unwrap();
+        assert_eq!(
+            s.resident_iter()
+                .find(|(k, _)| **k == coarse)
+                .unwrap()
+                .1
+                .drop,
+            2.5
+        );
+        for k in &keys {
+            s.set_visible(*k, true);
+        }
+        s.update_desired(Vec3::new(20_000.0, 2.0, 10.0));
+        let mut evicted = s.reconcile(cam);
+        evicted.sort();
+        assert_eq!(evicted, keys.clone().tap_sort());
     }
 }

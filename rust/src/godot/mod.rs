@@ -1,5 +1,5 @@
-//! The Godot shell: config resources, the `TerrainStreamer` node, GPU resource management.
+//! The Godot shell: config resources, the `TerrainStreamer` node, the blocking `TerrainTiles`
+//! surface and the mesh / material conversions they share.
 pub mod configs;
-pub mod gpu;
-pub mod shader;
+pub mod draw;
 pub mod streamer;
