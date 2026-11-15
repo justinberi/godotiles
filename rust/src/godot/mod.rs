@@ -3,3 +3,4 @@
 pub mod configs;
 pub mod draw;
 pub mod streamer;
+pub mod tiles;
