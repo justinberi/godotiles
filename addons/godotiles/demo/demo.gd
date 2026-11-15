@@ -1,6 +1,8 @@
 extends Node3D
 ## The godotiles demo: fly over real-world terrain with a loading screen, large-world
-## rebasing, ground-collision crash detection and sky-matched fog.
+## rebasing and ground-collision crash detection. The sun, the sky and the distance fog are the
+## scene's own (main.tscn): the terrain is drawn with StandardMaterial3D, so they apply to it.
+## Tiles above z15 sample the z15 heightmaps.
 ##
 ## Controls: A/D roll, Q/E yaw, W/S pitch, +/- throttle, R reset after a crash,
 ## K toggle zoom labels, L toggle tile bounds. Change LAT/LON to fly anywhere.
@@ -11,8 +13,6 @@ extends Node3D
 const LAT := 35.97391
 const LON := -113.76892
 
-## Sky / fog color (raylib's SKYBLUE, for parity with the other demos).
-const SKY := Color8(102, 191, 255)
 ## User-space drift (meters) that triggers a large-world rebase.
 const REBASE_THRESHOLD := 4096.0
 const START_ALTITUDE := 5000.0
@@ -28,25 +28,11 @@ var help_label: Label
 
 
 func _ready() -> void:
-	# --- terrain configuration (the streamer already ran its _ready with inspector defaults;
-	# mutate the sub-resources first, then assign `world` last: that setter rebuilds the world
-	# and re-reads every config)
 	terrain.network.threads = 8
-	terrain.rendering.fog_color = SKY
-	terrain.rendering.ambient_light = Color8(200, 200, 200)
-	# skirts (with the 1.01 mesh overlap below) hide the cracks between LOD levels
-	terrain.rendering.skirt_drop = 500.0
 	var world := TerrainWorldConfig.from_lat_lon(LAT, LON)
-	# opt into greater zoom: imagery fetches natively, heightmaps above z15 are synthesized,
-	# normals default to flat
 	world.max_zoom = 17
-	var overlap := PackedFloat32Array()
-	overlap.resize(14)
-	overlap.fill(1.01)
-	world.skirt_overlap = overlap
 	terrain.world = world
 
-	# --- camera: over the anchor, looking down-forward
 	var start := terrain.initial_position(START_ALTITUDE)
 	camera.position = start
 	camera.look_at(start + Vector3(-1000, -300, -1000), Vector3.UP)

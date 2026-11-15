@@ -4,7 +4,7 @@
 // Usage: tiles-cache <x> <y>
 //   <x> <y>  zoom-9 tile coordinates
 //
-// Downloads texture / heightmap / normals tiles for every zoom in
+// Downloads texture / heightmap tiles for every zoom in
 // [min-zoom, max-zoom] (from tiles-cache-config.json) covering the subtree
 // rooted at the zoom-9 tile (x, y). Files are written under the configured
 // *-path directories using the same `<zoom>/<x>/<y>.png` layout the C++
@@ -47,12 +47,10 @@ const noop = () => {};
 const esri_tex_url = (zoom, x, y) => `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${zoom}/${y}/${x}`;
 const mapbox_tex_url = (zoom, x, y) => `https://api.mapbox.com/v4/mapbox.satellite/${zoom}/${x}/${y}.pngraw?access_token=${TOKEN}`;
 const hm_url = (zoom, x, y) => `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${zoom}/${x}/${y}.png`;
-const nl_url = (zoom, x, y) => `https://s3.amazonaws.com/elevation-tiles-prod/normal/${zoom}/${x}/${y}.png`;
 
 const layers = [
     {name: "texture", base: config["tx-path"], url: TOKEN ? mapbox_tex_url : esri_tex_url},
     {name: "heightmap", base: config["hm-path"], url: hm_url},
-    {name: "normals", base: config["nl-path"], url: nl_url},
 ];
 
 async function fileExists(path) {

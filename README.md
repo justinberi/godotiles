@@ -26,21 +26,30 @@ Godotiles is the Godot port of [raytiles](https://github.com/ziv/raytiles) (rayl
 [bevytiles](https://github.com/ziv/bevytiles) (Bevy): a Rust GDExtension with the same tile
 cache format, LOD policy and defaults.
 
+> **This fork** (branch `godot-v0.1.3-collision`) carries the CPU meshing of our bevytiles fork
+> (`bevy-v0.2.0-collision`, commit `af12527`): every tile is meshed on the CPU from one height
+> function per elevation zoom, so neighbours share their edge vertices and a Godot app can
+> draw, collide with and sense the same terrain the Bevy simulator does. It replaces upstream's
+> GPU displacement shader, normal-map tiles and heightmap synthesis above the native zoom.
+
 ## Features
 
 - Streaming and rendering **any** location on Earth
-- Adaptive quadtree **LOD**, zoom 9–22 (terrain synthesized above the providers' native zoom)
-- **Lights and shadows** via normal maps, distance fog matched to your sky
-- Ground-truth **altitude queries** for collision and spawning
+- Adaptive quadtree **LOD**, zoom 9–22, or fixed **rings** around a ground vehicle
+- Tiles **meshed on the CPU** with skirts, drawn with `StandardMaterial3D`: the scene's
+  **lights, shadows and fog** apply
+- Ground-truth **altitude queries** on the drawn triangles, and the same vertices for
+  **colliders and sensors** (`TerrainTiles`)
 - Configurable and **provider agnostic** (Esri / Mapbox imagery, Mapzen Terrarium elevation)
 - Background downloading on worker threads with a persistent, resumable **on-disk cache**
+  (any layout, so another program's cache can be shared; offline mode reads it alone)
 - Large-world shifting for float-precision-safe worlds of any size
 - Prebuilt binaries for **macOS, Linux and Windows**; usable from GDScript and C#
 - Open source, MIT / Apache-2.0
 
 ## Screenshots
 
-| cruise over the Grand Canyon | 400 m AGL (synthesized z16–17 terrain) | debug overlay (K / L) |
+| cruise over the Grand Canyon | 400 m AGL | debug overlay (K / L) |
 |---|---|---|
 | ![cruise](screenshots/grand-canyon-cruise.jpg) | ![low](screenshots/grand-canyon-low.jpg) | ![overlay](screenshots/debug-overlay.jpg) |
 
@@ -70,9 +79,9 @@ extends Node3D
 func _ready() -> void:
     var terrain := TerrainStreamer.new()
     terrain.world = TerrainWorldConfig.from_lat_lon(46.206889, 9.497194)  # the Dolomites
-    terrain.rendering.fog_color = Color8(102, 191, 255)                    # match your sky
-    terrain.camera_path = $Camera3D.get_path()
+    terrain.focus_path = $Camera3D.get_path()                              # what streaming follows
     add_child(terrain)
+    add_child(DirectionalLight3D.new())                                    # light it as any mesh
 
     $Camera3D.near = 1.0
     $Camera3D.far = 400000.0     # see to the horizon (the inspector caps at 4000; code does not)
@@ -80,24 +89,47 @@ func _ready() -> void:
     $Camera3D.look_at($Camera3D.position + Vector3(-1000, -300, -1000), Vector3.UP)
 ```
 
-Configuration is four resources on the node — `world`, `streaming`, `rendering`
-(runtime-mutable), `network` — mirroring raytiles' `config`. `world.max_zoom` defaults to 15;
-raising it (≤ 22) opts into heightmaps synthesized from the native-zoom ancestors and flat
-default normals. Queries: `ground_height(pos)` (a float, or `null` when no tile covers the
-point), `is_loading` / `loading_progress` for a splash screen, `get_resident_tiles()` for debug
-overlays. Large worlds use the raytiles rebase convention via `world_offset`
-(`absolute = user − world_offset`); see `addons/godotiles/demo/demo.gd`.
+Configuration is four resources on the node — `world`, `streaming`, `rendering`, `network`.
+`world.elevation_zoom` (15) is the zoom of the heightmaps every tile's heights come from; finer
+tiles (up to `world.max_zoom`) sample it. `streaming.rings` (an array of `TerrainRing`: zoom,
+radius, drop) replaces the quadtree when not empty. The terrain lives under the node's own
+transform and follows `focus_path` (any Node3D; the viewport camera when empty);
+`pinned_tiles` (`Vector3i(zoom, x, z)` keys) are tiles the app draws itself, never streamed or
+covered. Queries: `ground_height(pos)` (a float, or `null` when no tile covers the point),
+`is_loading` / `loading_progress`, `get_resident_tiles()`. Large worlds use the raytiles rebase
+convention via `world_offset` (`absolute = user − world_offset`); see
+`addons/godotiles/demo/demo.gd`.
 
-See [`plan.md`](plan.md) for the full design: coordinate spaces, the frame loop, the LOD policy,
-the tile lifecycle, the shader, and the list of traps.
+`TerrainTiles` is the blocking side, for an app that builds tiles itself and preloads a cache:
+
+```gdscript
+var tiles := TerrainTiles.create(terrain.world, terrain.network)
+tiles.world_offset = terrain.world_offset
+var rings := [TerrainRing.create(19, 3, 0.0), TerrainRing.create(17, 3, 0.4)]
+var keys := tiles.rings_within(rings, Vector3.ZERO, 300.0, [])          # Vector3i(zoom, x, z)
+for key in keys:
+    var p := tiles.provider_tile(key)
+    tiles.fetch(TerrainTiles.KIND_TEXTURE, key.x, p.x, p.y)              # "" or the reason
+for h in tiles.heightmaps_for(keys):                                     # Vector3i(zoom, x, y)
+    tiles.fetch(TerrainTiles.KIND_HEIGHTMAP, h.x, h.y, h.z)
+
+var g := tiles.geometry(tiles.key_at(19, Vector3.ZERO))  # vertices / normals / uvs / indices about g.origin
+var faces := PackedVector3Array()
+for i in g.indices:
+    faces.append(g.vertices[i])
+var shape := ConcavePolygonShape3D.new()                                 # a collider of the drawn triangles
+shape.set_faces(faces)
+```
+
+See [`plan.md`](plan.md) for the design: coordinate spaces, the frame loop, the geometry, the
+LOD policies and the tile lifecycle.
 
 ## Layout
 
 | path | role |
 |---|---|
-| `rust/src/core/` | engine-agnostic core (no Godot types): config, LOD policy, synthesis, height grids, frustum, source (worker pool + HTTP + disk cache), tile lifecycle store |
-| `rust/src/godot/` | the Godot shell: `TerrainStreamer` node, config resources, GPU resources |
-| `rust/shaders/terrain.gdshader` | displacement, lighting, fog (embedded into the binary) |
+| `rust/src/core/` | engine-agnostic core (no Godot types): config, LOD policy, CPU geometry, heights, frustum, source (blocking fetcher + worker pool + disk cache), tile lifecycle store |
+| `rust/src/godot/` | the Godot shell: `TerrainStreamer`, `TerrainTiles`, config resources, mesh / material conversion |
 | `addons/godotiles/` | the distributable addon |
 | `addons/godotiles/demo/` | the demo scenes and scripts (ship with the addon) |
 | `tests/godot/` | headless smoke test (`godot --headless --path . -s tests/godot/smoke.gd`) |
@@ -105,11 +137,12 @@ the tile lifecycle, the shader, and the list of traps.
 
 ## Notes
 
-- Data: imagery © Esri; elevation / normals from the Mapzen / AWS terrain tiles. Mind their
+- Data: imagery © Esri; elevation from the Mapzen / AWS terrain tiles. Mind their
   terms. Set `network.texture_url` to a Mapbox template with your token for Mapbox imagery.
 - `cargo test --manifest-path rust/Cargo.toml` runs the full suite (LOD snapshots identical to
-  the C++ and Bevy engines, synthesis math, store policy, source integration against seeded
-  caches — all offline).
+  the C++ and Bevy engines, rings and pinned tiles, geometry seams, store policy, source and
+  cache integration against seeded caches — all offline). The headless smoke test needs the
+  project imported once (`godot --headless --path . --import`).
 - macOS: an unsigned download may need `xattr -dr com.apple.quarantine addons/godotiles/bin/macos`.
 
 ## License

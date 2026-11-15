@@ -9,10 +9,13 @@ func _ready() -> void:
 
 	# 2. the streamer with default configuration, anchored at lat/lon
 	var terrain := TerrainStreamer.new()
+	terrain.name = "TerrainStreamer"
 	terrain.world = TerrainWorldConfig.from_lat_lon(lat, lon)
-	terrain.rendering.fog_color = Color8(102, 191, 255) # match the sky
-	terrain.camera_path = $Camera3D.get_path()
+	terrain.focus_path = $Camera3D.get_path()
 	add_child(terrain)
+	var sun := DirectionalLight3D.new()
+	sun.rotation_degrees = Vector3(-60, 0, 0)
+	add_child(sun)
 
 	# 3. the camera: 5000 m above the anchor, looking south-east and down; make sure
 	#    it sees to the horizon (the inspector caps `far` at 4000 — code does not)
